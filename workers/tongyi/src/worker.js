@@ -435,6 +435,10 @@ function formatSeatConfigNote(seatConfig) {
     present(config.violationLimitDay) ? `${config.violationLimitDay}天统计周期` : "未返回",
     present(config.violationLimitDuration) ? `限制${config.violationLimitDuration}天` : "未返回",
   ].join(" / ");
+  const reserveDuration = Number(config.reserveDuration);
+  const durationText = Number.isFinite(reserveDuration) && reserveDuration > 0
+    ? `${reserveDuration} 小时`
+    : "未返回";
   let securityText = "未返回";
   if (Number(config.securityVerify) === 0) securityText = "关闭";
   if (Number(config.securityVerify) === 1) {
@@ -452,6 +456,7 @@ function formatSeatConfigNote(seatConfig) {
     `违约规则：${violationText}`,
     `安全检测：${securityText}`,
     `可预约时间：${timeText || "未返回"}`,
+    `单次预约时长上限约 ${durationText}`,
     `预约数量限制：${present(config.reserveNumLimit) ? config.reserveNumLimit : "未返回"}`,
     "==============================",
   ].join("\n");

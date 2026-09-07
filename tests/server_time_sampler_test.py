@@ -41,7 +41,7 @@ def test_sample_once_records_raw_clocks_and_monotonic_rtt():
     message, *args = log.call_args.args
     rendered = message % tuple(args)
     assert "本地发出：2026-09-04 05:25:10.123" in rendered
-    assert "请求耗时 RTT：163.40 ms" in rendered
+    assert "请求往返耗时：163.40 ms" in rendered
     assert "local_send_ms=1788470710123" in rendered
     assert "connection_reused=unknown" in rendered
     assert "服务器距官方开放：146.685 秒" in rendered
@@ -112,7 +112,7 @@ def test_summary_excludes_cold_connection_from_reused_percentiles():
     rendered = message % tuple(args)
     assert "冷连接：1" in rendered
     assert "复用连接：3" in rendered
-    assert "RTT 最小/最大：31.00 / 50.00 ms" in rendered
+    assert "请求往返耗时最小/最大：31.00 / 50.00 ms" in rendered
     assert "113.51" not in rendered
     assert "异常延迟样本：1" in rendered
 

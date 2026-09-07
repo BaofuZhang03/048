@@ -21,12 +21,14 @@ const seatConfigNote = formatSeatConfigNote({
   securityVerify: 1,
   securityVerifyType: 3,
   reserveNumLimit: 2,
+  reserveDuration: 5.0,
   commonTimeConfig: sameHours,
 });
 assert.match(seatConfigNote, /预约开放：前一天20:00/);
 assert.match(seatConfigNote, /违约规则：3次 \/ 15天统计周期 \/ 限制7天/);
 assert.match(seatConfigNote, /安全检测：开启，图标验证码/);
 assert.match(seatConfigNote, /可预约时间：周一～周日 07:00～22:30/);
+assert.match(seatConfigNote, /单次预约时长上限约 5 小时/);
 assert.doesNotMatch(seatConfigNote, /违约限制类型/);
 
 const splitHours = { ...sameHours };

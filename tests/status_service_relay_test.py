@@ -9,6 +9,10 @@ assert '"/api/internal/user-status"' in public
 assert "_call_self_service(" in public
 assert "add_service_audit(" in public
 assert "push_user_to_kv_now" not in public
+assert "cache_user(school_id, local_user, mark_synced=True)" in public
+assert '("pauseUntil", "pause_until")' in public
+assert '("lastResumedAt", "last_resumed_at")' in public
+assert public.index('if remote.get("ok"):\n') < public.index('remote.get("saveMode") != "noop"')
 
 internal = source.split('@app.post("/api/internal/user-status")', 1)[1].split(
     '@app.get("/api/school-meta")', 1
