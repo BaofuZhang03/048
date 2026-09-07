@@ -216,3 +216,12 @@ workers/tongyi/src/*
 # 测试/辅助脚本
 utils/extract_plan_test.py
 scripts/compare_seat_ttfb.py
+
+# GitHub Actions 用户仓库不需要上传
+.wrangler/
+logs/
+*.log.*
+tests/
+deploy/
+deploy_*.sh
+workers/
