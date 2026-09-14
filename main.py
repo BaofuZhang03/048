@@ -230,6 +230,60 @@ def _pick_next_ordered_fallback_seat(
     return None, "", max(1, start_attempt_no)
 
 
+def _submit_reported_seat_occupied(client) -> bool:
+    result = getattr(client, "last_submit_result", None)
+    msg = str(result.get("msg", "")) if isinstance(result, dict) else ""
+    return any(marker in msg for marker in ("已有预约", "已被占用", "座位已被占"))
+
+
+def _advance_conflicted_seats_only(
+    users, success_list, sessions, submit_occupied, current_dayofweek,
+    original_seatids, fallback_used_seats, attempt_no, log_prefix,
+):
+    """Token/network failures keep the seat; only proven occupancy advances it."""
+    changed = False
+    for i, user in enumerate(users):
+        if success_list[i] or current_dayofweek not in user.get("daysofweek", []):
+            continue
+        seats = user.get("seatid")
+        current_seat = seats if isinstance(seats, str) else (seats[0] if seats else "")
+        conflict = bool(submit_occupied[i])
+        client = sessions[i] if sessions is not None and i < len(sessions) else None
+        if not conflict and client is not None and current_seat and not is_custom_day_times(user.get("times")):
+            day = resolve_request_day(
+                user["times"], RESERVE_NEXT_DAY,
+                use_custom_day=bool(user.get("use_custom_day")),
+                reserve_day_offset=RESERVE_DAY_OFFSET,
+            )
+            conflict = client.check_getusedtimes_conflict_sync(
+                user["times"], user["roomid"], current_seat, day,
+                fid_enc=user.get("fidEnc") or "",
+            ) is True
+        if not conflict:
+            logging.info(
+                "[%s] Config %s: 未明确发现座位 %s 被占，保留原座位重试",
+                log_prefix, i, current_seat or "未知",
+            )
+            continue
+        base = original_seatids[i]
+        if base is None:
+            continue
+        new_seat, offset, _ = _pick_next_ordered_fallback_seat(
+            base, attempt_no, fallback_used_seats[i]
+        )
+        if not new_seat:
+            continue
+        fallback_used_seats[i].add(new_seat)
+        user["seatid"] = [new_seat]
+        submit_occupied[i] = False
+        changed = True
+        logging.info(
+            "[%s] Config %s: 座位 %s 明确被占，切换到 %s (offset %s)",
+            log_prefix, i, current_seat, new_seat, offset,
+        )
+    return changed
+
+
 def _normalize_backup_slots(raw_slots) -> list[dict]:
     if isinstance(raw_slots, str):
         result = []
@@ -645,6 +699,56 @@ def _get_beijing_end_dt_from_target(target_dt: datetime.datetime) -> datetime.da
     return target_dt + datetime.timedelta(seconds=40)
 
 
+def _get_hour_open_dt_from_endtime(target_dt: datetime.datetime) -> datetime.datetime:
+    """开放时间只取本地结束时间的小时，分钟、秒和微秒均归零。"""
+    return _get_beijing_end_dt_from_target(target_dt).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _wait_for_page_server_open(server_now_text: str, open_dt: datetime.datetime) -> None:
+    """按页面 serverNow 的剩余时间再加 4ms 等待，期间不刷新页面 token。"""
+    if not server_now_text:
+        return
+    try:
+        server_now = datetime.datetime.fromisoformat(server_now_text)
+    except ValueError:
+        logging.warning("[strategic] 页面 serverNow 无法解析：%s，跳过开放时间等待", server_now_text)
+        return
+    server_now = server_now.replace(microsecond=(server_now.microsecond // 1000) * 1000)
+    if server_now.tzinfo is None:
+        server_now = server_now.replace(tzinfo=open_dt.tzinfo)
+    remaining_s = (open_dt - server_now.astimezone(open_dt.tzinfo)).total_seconds()
+    if remaining_s <= 0:
+        return
+    wait_s = remaining_s + 0.004
+    logging.info(
+        "[strategic] 当天 token 页面尚未到开放时间：serverNow=%s，开放时间=%s；"
+        "持有当前 token 等待 %.1fms（剩余 %.1fms + 4ms）后提交",
+        server_now_text,
+        open_dt.isoformat(),
+        wait_s * 1000,
+        remaining_s * 1000,
+    )
+    time.sleep(wait_s)
+
+
+def _page_server_has_opened(server_now_text: str, open_dt: datetime.datetime) -> bool:
+    """页面时间缺失/异常时保持原流程；可解析时只接受已到开放时间的页面。"""
+    if not server_now_text:
+        return True
+    try:
+        server_now = datetime.datetime.fromisoformat(server_now_text)
+    except ValueError:
+        logging.warning("[strategic] 页面 serverNow 无法解析：%s，继续使用当前 token", server_now_text)
+        return True
+    if server_now.tzinfo is None:
+        server_now = server_now.replace(tzinfo=open_dt.tzinfo)
+    return server_now.astimezone(open_dt.tzinfo) >= open_dt
+
+
 def _get_strategy_login_deadline(target_dt: datetime.datetime) -> datetime.datetime:
     """战略登录的最晚补救时刻。
 
@@ -726,6 +830,7 @@ def _probe_then_get_page_token(
     not_open_retry_until=None,
     not_open_retry_interval: float | None = None,
     start_log_message: str | None = None,
+    page_server_open_dt: datetime.datetime | None = None,
 ):
     """战略模式首枪取 token 前的轻量探测。"""
     probe_start_dt = target_dt + datetime.timedelta(milliseconds=FAST_PROBE_START_OFFSET_MS)
@@ -762,6 +867,21 @@ def _probe_then_get_page_token(
         probe_token = probe_result.get("token", "")
         probe_value = probe_result.get("value", "") if require_value else ""
         if probe_token:
+            server_now = str(probe_result.get("server_now", ""))
+            if page_server_open_dt is not None and not _page_server_has_opened(
+                server_now, page_server_open_dt
+            ):
+                logging.info(
+                    "[strategic] 快速探测第 %d 次虽拿到 token，但页面 serverNow=%s "
+                    "早于开放时间=%s；丢弃本次 token 并重新获取",
+                    probe_attempt,
+                    server_now,
+                    page_server_open_dt.isoformat(),
+                )
+                if probe_checked_dt >= probe_deadline_dt:
+                    break
+                time.sleep(FAST_PROBE_INTERVAL_MS / 1000)
+                continue
             logging.info(
                 f"[strategic] 快速探测第 {probe_attempt} 次：拿到可复用 token；"
                 f"探测时间 {probe_checked_dt}，距目标时刻 {elapsed_ms:.1f}ms，"
@@ -780,12 +900,29 @@ def _probe_then_get_page_token(
     if formal_fetch_not_before is not None and _beijing_now() < formal_fetch_not_before:
         _wait_until(formal_fetch_not_before)
 
-    return s._get_page_token(
-        token_url,
-        require_value=require_value,
-        not_open_retry_until=not_open_retry_until,
-        not_open_retry_interval=not_open_retry_interval,
-    )
+    while True:
+        formal_result = s._get_page_token(
+            token_url,
+            require_value=require_value,
+            not_open_retry_until=not_open_retry_until,
+            not_open_retry_interval=not_open_retry_interval,
+            return_server_now=page_server_open_dt is not None,
+        )
+        if page_server_open_dt is None:
+            return formal_result
+        token, value, server_now = formal_result
+        if not token or _page_server_has_opened(server_now, page_server_open_dt):
+            return token, value
+        logging.info(
+            "[strategic] 正式取 token 的页面 serverNow=%s 早于开放时间=%s；"
+            "丢弃本次 token 并重新获取",
+            server_now,
+            page_server_open_dt.isoformat(),
+        )
+        if not_open_retry_until is not None and _beijing_now() >= not_open_retry_until:
+            logging.warning("[strategic] 重取开放后 token 已到硬截止时间，放弃当前 token")
+            return "", ""
+        time.sleep(not_open_retry_interval or FAST_PROBE_INTERVAL_MS / 1000)
 
 
 def _get_page_token_until_success(
@@ -815,10 +952,16 @@ def _get_page_token_until_success(
     return token, value
 
 
+def _log_first_page_token_success_trace(session_obj) -> None:
+    trace = getattr(session_obj, "_last_page_token_success_trace", None) or {}
+    logging.info("[ADMIN_FIRST_PAGE_TOKEN] %s", json.dumps(trace, ensure_ascii=False))
+
+
 def _burst_shot_worker(
     index, offset_ms, target_dt, s, token_url,
     times, roomid, seatid, captcha, action, results,
-    token_submit_lock, submitted_captchas, use_custom_day=False, day="", fid_enc=""
+    token_submit_lock, submitted_captchas, use_custom_day=False, day="", fid_enc="",
+    page_server_open_dt=None,
 ):
     """定时连发（极限型）的单次提交工作线程。
 
@@ -841,14 +984,23 @@ def _burst_shot_worker(
         return
 
     with token_submit_lock:
-        token, value = s._get_page_token(
+        token_result = s._get_page_token(
             token_url,
             require_value=True,
+            return_server_now=page_server_open_dt is not None,
         )
+        if page_server_open_dt is None:
+            token, value = token_result
+        else:
+            token, value, server_now = token_result
+            if token:
+                _wait_for_page_server_open(server_now, page_server_open_dt)
         if not token:
             logging.error(f"[burst] 第 {index + 1} 枪获取页面 token 失败")
             results[index] = False
             return
+        if index == 0:
+            _log_first_page_token_success_trace(s)
         logging.info(
             f"[burst] 第 {index + 1} 枪从 {token_url} 即时获取 token：{token}"
         )
@@ -878,6 +1030,7 @@ def strategic_first_attempt(
     success_list=None,
     sessions=None,
     fallback_used_seats=None,
+    submit_occupied=None,
 ):
     """只在第一次调用时使用的“有策略抢座”。
 
@@ -891,6 +1044,8 @@ def strategic_first_attempt(
         success_list = [False] * len(users)
     if fallback_used_seats is None or len(fallback_used_seats) != len(users):
         fallback_used_seats = [set() for _ in users]
+    if submit_occupied is None or len(submit_occupied) != len(users):
+        submit_occupied = [False] * len(users)
 
     now = _beijing_now()
     # 如果已经过了目标时间，直接退回到普通逻辑由外层处理
@@ -2402,6 +2557,11 @@ def strategic_first_attempt(
                         times, burst_room, burst_seat, burst_cap, action, burst_results,
                         token_submit_lock, burst_submitted_captchas,
                         use_custom_day, submit_day, burst_fid,
+                        (
+                            _get_hour_open_dt_from_endtime(target_dt)
+                            if STRATEGIC_MODE == "C" and submit_day == warm_day
+                            else None
+                        ),
                     ),
                     daemon=True,
                     name=f"burst-shot-{burst_i + 1}",
@@ -2551,6 +2711,11 @@ def strategic_first_attempt(
                     formal_fetch_not_before=fetch_dt,
                     not_open_retry_until=not_open_retry_until,
                     not_open_retry_interval=0.005,
+                    page_server_open_dt=(
+                        _get_hour_open_dt_from_endtime(target_dt)
+                        if first_token_day == warm_day
+                        else None
+                    ),
                     start_log_message=(
                         f"[strategic] [C] 开始探测"
                         f"（从目标时刻 + {FAST_PROBE_START_OFFSET_MS}ms 开始轻探测，"
@@ -2561,6 +2726,7 @@ def strategic_first_attempt(
                 if not token1:
                     logging.error("[策略] [C] 获取 token 失败，跳过当前配置")
                     continue
+                _log_first_page_token_success_trace(s)
                 if SKIP_FIRST_SEAT_QUERY:
                     logging.info(
                         f"[策略] [C] 已从 {_first_token_url} 获取 token：{token1}；"
@@ -2630,6 +2796,7 @@ def strategic_first_attempt(
                 if not token1:
                     logging.error("[策略] [A] 第一枪 token 为空，跳过当前配置")
                     continue
+                _log_first_page_token_success_trace(s)
 
                 submit_dt1 = target_dt + datetime.timedelta(milliseconds=FIRST_SUBMIT_OFFSET_MS)
                 _wait_until(submit_dt1)
@@ -2696,6 +2863,7 @@ def strategic_first_attempt(
                 if not token1:
                     logging.error("[策略] 第一枪获取页面 token 失败，跳过当前配置")
                     continue
+                _log_first_page_token_success_trace(s)
                 logging.info(
                     f"[策略] 第一枪已从 {_first_token_url} 获取页面 token：{token1}，value：{value1}"
                 )
@@ -2739,6 +2907,7 @@ def strategic_first_attempt(
                     logging.info(
                         "[策略] 第一枪命中终止型失败信息，跳过第二/第三枪"
                     )
+                    submit_occupied[index] = _submit_reported_seat_occupied(s)
                     success_list[index] = suc
                     continue
                 logging.info("[策略] 第一枪未成功，准备第二枪：先准备验证码，再查座，空闲后取新页面 token 提交")
@@ -2836,6 +3005,7 @@ def strategic_first_attempt(
                     logging.info(
                         "[策略] 第二枪命中终止型失败信息，跳过第三枪"
                     )
+                    submit_occupied[index] = _submit_reported_seat_occupied(s)
                     success_list[index] = suc
                     continue
                 logging.info("[策略] 第二枪未成功，准备第三枪：先准备验证码，再查座，空闲后取新页面 token 提交")
@@ -2898,13 +3068,15 @@ def strategic_first_attempt(
                             use_custom_day=use_custom_day,
                         )
 
+        submit_occupied[index] = not suc and _submit_reported_seat_occupied(s)
         success_list[index] = suc
 
     return success_list
 
 
 def login_and_reserve(
-    users, usernames, passwords, action, success_list=None, sessions=None, end_dt=None
+    users, usernames, passwords, action, success_list=None, sessions=None, end_dt=None,
+    submit_occupied=None,
 ):
     logging.info(
         f"Global settings: \nSLEEPTIME: {SLEEPTIME}\nENDTIME: {ENDTIME}\nENABLE_SLIDER: {ENABLE_SLIDER}\nENABLE_TEXTCLICK: {ENABLE_TEXTCLICK}\nENABLE_ICONCLICK: {ENABLE_ICONCLICK}\nENABLE_ROTATE: {ENABLE_ROTATE}\nRESERVE_NEXT_DAY: {RESERVE_NEXT_DAY}"
@@ -2922,6 +3094,8 @@ def login_and_reserve(
 
     if success_list is None:
         success_list = [False] * len(users)
+    if submit_occupied is None or len(submit_occupied) != len(users):
+        submit_occupied = [False] * len(users)
 
     # 如果传入了 sessions，但长度和 users 不匹配，则忽略 sessions，退回每轮重登
     if sessions is not None and len(sessions) != len(users):
@@ -3025,6 +3199,7 @@ def login_and_reserve(
                 use_custom_day=use_custom_day,
                 backup_slots=backup_slots,
             )
+            submit_occupied[index] = not suc and _submit_reported_seat_occupied(s)
             success_list[index] = suc
     return success_list
 
@@ -3033,9 +3208,6 @@ def main(users, action=False):
     global MAX_ATTEMPT
     target_dt = _get_beijing_target_from_endtime()
     end_dt = _get_beijing_end_dt_from_target(target_dt)
-    logging.info(
-        f"start time {get_log_time(action)}, action {'on' if action else 'off'}, target_dt {target_dt}, end_dt {end_dt}"
-    )
     attempt_times = 0
     usernames, passwords = None, None
     if action:
@@ -3050,6 +3222,14 @@ def main(users, action=False):
     current_dayofweek = get_current_dayofweek(action)
     today_reservation_num = sum(
         1 for d in users if current_dayofweek in d.get("daysofweek")
+    )
+    if today_reservation_num > 1:
+        # 多段预约给后续段留出一次普通提交机会，同时用 75 秒硬截止避免无限运行。
+        end_dt = max(end_dt, target_dt + datetime.timedelta(seconds=75))
+    logging.info(
+        "start time %s, action %s, target_dt %s, end_dt %s, active_slots=%s",
+        get_log_time(action), "on" if action else "off", target_dt, end_dt,
+        today_reservation_num,
     )
 
     # 本地与 GitHub Actions 都执行一次“有策略”的第一次尝试，
@@ -3075,6 +3255,7 @@ def main(users, action=False):
     seat_increment_attempts = 0
     fallback_attempt_limit = MAX_SEAT_INCREMENT_ATTEMPTS
     fallback_used_seats = [set() for _ in users]
+    submit_occupied = [False] * len(users)
 
     while True:
         current_dt = _beijing_now()
@@ -3096,34 +3277,18 @@ def main(users, action=False):
                 success_list,
                 sessions,
                 fallback_used_seats,
+                submit_occupied,
             )
             strategic_done = True
 
             # 预热三次结束后，如果仍有配置未成功，按固定顺序补位并立即继续尝试
             if success_list is not None and sum(success_list) < today_reservation_num:
-                seat_increment_attempts = 1
-                for i, user in enumerate(users):
-                    if not success_list[i] and original_seatids[i] is not None \
-                            and current_dayofweek in user.get("daysofweek", []):
-                        new_seat, offset, _ = _pick_next_ordered_fallback_seat(
-                            original_seatids[i],
-                            seat_increment_attempts,
-                            fallback_used_seats[i],
-                        )
-                        if not new_seat:
-                            logging.info(
-                            f"[seat-ordered-after-strategic] Config {i}: skip invalid/used fallback "
-                            f"(base {original_seatids[i]}, offset {offset or 'none'}, "
-                            f"attempt {seat_increment_attempts}/{fallback_attempt_limit})"
-                            )
-                            continue
-                        fallback_used_seats[i].add(new_seat)
-                        user["seatid"] = [new_seat]
-                        logging.info(
-                            f"[seat-ordered-after-strategic] Config {i}: try seat {new_seat} "
-                            f"(base {original_seatids[i]}, offset {offset}, "
-                            f"attempt {seat_increment_attempts}/{fallback_attempt_limit})"
-                        )
+                if _advance_conflicted_seats_only(
+                    users, success_list, sessions, submit_occupied,
+                    current_dayofweek, original_seatids, fallback_used_seats,
+                    1, "seat-ordered-after-strategic",
+                ):
+                    seat_increment_attempts = 1
                 # 递增座位后立即调用 login_and_reserve（每个座位只试一次）
                 MAX_ATTEMPT = 1
                 if sessions is not None:
@@ -3131,7 +3296,8 @@ def main(users, action=False):
                         if s_obj is not None:
                             s_obj.max_attempt = 1
                 success_list = login_and_reserve(
-                    users, usernames, passwords, action, success_list, sessions, end_dt
+                    users, usernames, passwords, action, success_list, sessions, end_dt,
+                    submit_occupied,
                 )
         else:
             # 预热结束后仍未成功：未成功配置继续按固定顺序补位尝试
@@ -3146,29 +3312,13 @@ def main(users, action=False):
                         f"success list {success_list}"
                     )
                     return
-                seat_increment_attempts += 1
-                for i, user in enumerate(users):
-                    if not success_list[i] and original_seatids[i] is not None \
-                            and current_dayofweek in user.get("daysofweek", []):
-                        new_seat, offset, _ = _pick_next_ordered_fallback_seat(
-                            original_seatids[i],
-                            seat_increment_attempts,
-                            fallback_used_seats[i],
-                        )
-                        if not new_seat:
-                            logging.info(
-                            f"[seat-ordered] Config {i}: skip invalid/used fallback "
-                            f"(base {original_seatids[i]}, offset {offset or 'none'}, "
-                            f"attempt {seat_increment_attempts}/{fallback_attempt_limit})"
-                            )
-                            continue
-                        fallback_used_seats[i].add(new_seat)
-                        user["seatid"] = [new_seat]
-                        logging.info(
-                            f"[seat-ordered] Config {i}: try seat {new_seat} "
-                            f"(base {original_seatids[i]}, offset {offset}, "
-                            f"attempt {seat_increment_attempts}/{fallback_attempt_limit})"
-                        )
+                next_attempt = seat_increment_attempts + 1
+                if _advance_conflicted_seats_only(
+                    users, success_list, sessions, submit_occupied,
+                    current_dayofweek, original_seatids, fallback_used_seats,
+                    next_attempt, "seat-ordered",
+                ):
+                    seat_increment_attempts = next_attempt
 
                 # 固定顺序补位模式下每个座位只提交一次，失败就下一轮切换到下一个偏移
                 MAX_ATTEMPT = 1
@@ -3177,7 +3327,8 @@ def main(users, action=False):
                         if s_obj is not None:
                             s_obj.max_attempt = 1
             success_list = login_and_reserve(
-                users, usernames, passwords, action, success_list, sessions, end_dt
+                users, usernames, passwords, action, success_list, sessions, end_dt,
+                submit_occupied,
             )
 
         print(

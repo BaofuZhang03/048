@@ -132,7 +132,7 @@ jobs:
           out_file="key_logs_${user_name}.txt"
 
           if [[ -f reserve.log ]]; then
-            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$out_file" || true
+            grep -E "Start first attempt|开始策略首次尝试|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$out_file" || true
           else
             echo "reserve.log not found" > "$out_file"
           fi
@@ -173,7 +173,7 @@ jobs:
 
           log_file="key_logs_${USER_NAME}.txt"
           if [[ ! -f "$log_file" && -f reserve.log ]]; then
-            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$log_file" || true
+            grep -E "Start first attempt|开始策略首次尝试|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$log_file" || true
           fi
 
           if [[ ! -f "$log_file" ]]; then
@@ -391,7 +391,7 @@ jobs:
           out_file="key_logs_${user_name}.txt"
 
           if [[ -f reserve.log ]]; then
-            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$out_file" || true
+            grep -E "Start first attempt|开始策略首次尝试|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$out_file" || true
           else
             echo "reserve.log not found" > "$out_file"
           fi
@@ -432,7 +432,7 @@ jobs:
 
           log_file="key_logs_${USER_NAME}.txt"
           if [[ ! -f "$log_file" && -f reserve.log ]]; then
-            grep -E "Start first attempt|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$log_file" || true
+            grep -E "Start first attempt|开始策略首次尝试|login successfully|\[strategic\]|\[burst\]|\[warm\]|submit parameter|submit enc|Get token|Got token|token fetch failed|No submit_enc|captcha|Slider captcha token|Textclick captcha token|保存失败|seat-increment|dispatch|HTTP [0-9]{3}|exception|error|Current time|reserved successfully|success list" reserve.log | tail -n 260 > "$log_file" || true
           fi
 
           if [[ ! -f "$log_file" ]]; then

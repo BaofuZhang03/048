@@ -397,6 +397,7 @@ class reserve:
         self._rotate_normal_consumed_captcha_count = 0
         self._used_submit_values = set()
         self._used_submit_values_lock = threading.Lock()
+        self._last_page_token_success_trace = None
         self.requests = requests.session()
         self._office_trace_adapter = OfficeTraceHTTPAdapter(self)
         self.requests.mount("https://office.chaoxing.com/", self._office_trace_adapter)
@@ -578,6 +579,7 @@ class reserve:
             return None
 
         elapsed_seconds = time.monotonic() - started_at
+        logging.info("seat submit response headers: %s", dict(response.headers))
         html = response.content.decode("utf-8")
         try:
             return json.loads(html)
@@ -666,7 +668,7 @@ class reserve:
 
     @staticmethod
     def _is_abort_submit_failure(msg: str) -> bool:
-        return "非法预约" in msg or "您已达到违约次数上限" in msg
+        return "非法预约" in msg or "您已达到违约次数上限" in msg or "您已被管理员限制使用" in msg
 
     @classmethod
     def _abort_program_for_submit_msg(cls, msg: str):
@@ -715,6 +717,20 @@ class reserve:
             html or "",
         )
         return token_matches[0] if token_matches else ""
+
+    @staticmethod
+    def _extract_page_server_now(html: str) -> str:
+        match = re.search(
+            r"\bserverNow\s*=\s*new\s+Date\(\s*['\"]([^'\"]+)['\"]\s*\)",
+            html or "",
+        )
+        return match.group(1) if match else ""
+
+    @classmethod
+    def _log_page_server_now(cls, html: str, source: str) -> None:
+        server_now = cls._extract_page_server_now(html)
+        if server_now:
+            logging.info("[%s] 页面 serverNow=%s", source, server_now)
 
     def _record_office_request_trace(self, trace: dict):
         """记录发送层连接追踪信息。"""
@@ -937,6 +953,7 @@ class reserve:
         """
         if log_connection_reuse:
             self._connection_trace_context = {"kind": "first_fast_probe"}
+        request_started_at = _beijing_now_naive()
         try:
             response = self._get(
                 url=url,
@@ -979,6 +996,7 @@ class reserve:
             response.close()
             followed_redirect = True
             try:
+                request_started_at = _beijing_now_naive()
                 response = self._get(
                     url=redirect_url,
                     verify=False,
@@ -1015,6 +1033,8 @@ class reserve:
                 return {"is_not_open": True, "token": "", "value": ""}
 
         html = response.content.decode("utf-8", errors="ignore")
+        server_now = self._extract_page_server_now(html)
+        self._log_page_server_now(html, "轻探测")
         diagnostic = self._fast_probe_diagnostic(
             response,
             html,
@@ -1023,7 +1043,18 @@ class reserve:
         response.close()
         token = self._extract_submit_enc(html)
         if token:
-            return {"is_not_open": False, "token": token, "value": token}
+            self._last_page_token_success_trace = {
+                "started_at": request_started_at.isoformat(timespec="milliseconds") + "+08:00",
+                "received_at": _beijing_now_naive().isoformat(timespec="milliseconds") + "+08:00",
+                "server_now": server_now,
+                "url": response_url or url,
+            }
+            return {
+                "is_not_open": False,
+                "token": token,
+                "value": token,
+                "server_now": server_now,
+            }
         return {
             "is_not_open": False,
             "token": "",
@@ -1040,6 +1071,7 @@ class reserve:
         data=None,
         not_open_retry_until=None,
         not_open_retry_interval: float | None = None,
+        return_server_now: bool = False,
     ):
         """从页面提取提交用的 token。
 
@@ -1071,6 +1103,7 @@ class reserve:
             attempt = 0
             while True:
                 attempt += 1
+                request_started_at = _beijing_now_naive()
                 try:
                     if method.upper() == "POST":
                         response = self._post(
@@ -1127,14 +1160,23 @@ class reserve:
 
                 html = response.content.decode("utf-8", errors="ignore")
                 last_html = html
+                self._log_page_server_now(html, "页面token")
 
                 token = self._extract_submit_enc(html)
                 if token:
+                    self._last_page_token_success_trace = {
+                        "started_at": request_started_at.isoformat(timespec="milliseconds") + "+08:00",
+                        "received_at": _beijing_now_naive().isoformat(timespec="milliseconds") + "+08:00",
+                        "server_now": self._extract_page_server_now(html),
+                        "url": final_url or candidate_url,
+                    }
                     algorithm_value = token if require_value else ""
                     if attempt > 1:
                         logging.info(
                             f"Get page token from {candidate_url} succeeded on retry attempt {attempt}: {token}"
                         )
+                    if return_server_now:
+                        return token, algorithm_value, self._extract_page_server_now(html)
                     return token, algorithm_value
 
                 not_open_yet = self._is_token_page_not_open(response_url=final_url)
@@ -1192,6 +1234,8 @@ class reserve:
             logging.error(f"Full HTML of seat page saved to {filename}")
         except Exception as e:
             logging.warning(f"Failed to save debug HTML for seat page: {e}")
+        if return_server_now:
+            return "", "", ""
         return "", ""
 
     def warm_connection(self, url, timeout=5, *, quiet=False):

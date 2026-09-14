@@ -487,6 +487,9 @@ def extract_admin_timeline(log_text: str) -> list[dict]:
     submit_count = 0
     first_submit_seen = False
     patterns = [
+        ("account", "使用账号", "[策略] 开始策略首次尝试："),
+        ("first_page_token", "第一抢页面请求", "[第一抢页面Token] 请求开始="),
+        ("first_page_token", "第一抢页面Token", "[第一抢页面Token] 获取成功 serverNow="),
         ("captcha", "验证码", "Captcha submit order after normalization"),
         ("captcha", "验证码", "Pre-resolved slider captcha"),
         ("captcha", "验证码", "Pre-resolved textclick captcha"),
@@ -512,6 +515,34 @@ def extract_admin_timeline(log_text: str) -> list[dict]:
         ("token", "未开放", "当前区域未到开放预约时间"),
     ]
     for line in log_text.splitlines():
+        if "[ADMIN_FIRST_PAGE_TOKEN]" in line:
+            raw_trace = line.split("[ADMIN_FIRST_PAGE_TOKEN]", 1)[1].strip()
+            try:
+                trace = json.loads(raw_trace)
+            except (TypeError, ValueError):
+                trace = {}
+            if isinstance(trace, dict) and trace.get("started_at") and trace.get("received_at"):
+                url = normalize_text(trace.get("url"), 800)
+                server_now = normalize_text(trace.get("server_now"), 80)
+                timeline.extend(
+                    [
+                        {
+                            "time": normalize_text(trace.get("started_at"), 80),
+                            "shot": 0,
+                            "type": "first_page_token",
+                            "label": "第一抢页面请求",
+                            "message": f"开始请求页面 · URL：{url or '未记录'}",
+                        },
+                        {
+                            "time": normalize_text(trace.get("received_at"), 80),
+                            "shot": 0,
+                            "type": "first_page_token",
+                            "label": "第一抢页面Token",
+                            "message": f"获取页面信息成功 · 页面 serverNow：{server_now or '未提取到'}",
+                        },
+                    ]
+                )
+            continue
         if "submit parameter resolved" in line:
             submit_count += 1
             first_submit_seen = True
@@ -519,18 +550,34 @@ def extract_admin_timeline(log_text: str) -> list[dict]:
             break
         for event_type, label, needle in patterns:
             if needle in line:
-                if not first_submit_seen and event_type not in {"captcha", "token", "seat_query"}:
+                if not first_submit_seen and event_type not in {"account", "first_page_token", "captcha", "token", "seat_query"}:
                     continue
+                event_time = extract_log_timestamp(line)
+                message = sanitize_admin_log_line(line)
+                if label == "第一抢页面请求":
+                    started_match = re.search(r"请求开始=([^\s]+)", line)
+                    if started_match:
+                        event_time = started_match.group(1)
+                    url_match = re.search(r"\burl=(https?://\S+)", line)
+                    message = f"开始请求页面 · URL：{url_match.group(1) if url_match else '未记录'}"
+                elif label == "第一抢页面Token":
+                    server_now_match = re.search(r"serverNow=([^\s]+)", line)
+                    message = (
+                        "获取页面信息成功 · 页面 serverNow："
+                        + (server_now_match.group(1) if server_now_match else "未提取到")
+                    )
                 timeline.append(
                     {
-                        "time": extract_log_timestamp(line),
+                        "time": event_time,
                         "shot": submit_count if first_submit_seen else 0,
                         "type": event_type,
                         "label": label,
-                        "message": sanitize_admin_log_line(line),
+                        "message": message,
                     }
                 )
                 break
+    if sum(event.get("type") == "first_page_token" for event in timeline) == 2:
+        timeline = [event for event in timeline if event.get("type") != "token"]
     return timeline[-80:]
 
 
@@ -699,6 +746,22 @@ def build_result(run_dir: pathlib.Path, summary: dict, payload: dict, item: dict
     user_id = normalize_text(user.get("id") or user.get("user_id") or user.get("userId"), 120)
     account = normalize_text(user.get("phone") or user.get("username") or item.get("username"), 120)
     account_masked = mask_account(account)
+    account_events = [event for event in admin_timeline if event.get("type") == "account"]
+    if account_events:
+        admin_timeline = account_events[:1] + [
+            event for event in admin_timeline if event.get("type") != "account"
+        ]
+    elif account:
+        admin_timeline.insert(
+            0,
+            {
+                "time": normalize_text(item.get("started_at") or summary.get("started_at"), 80),
+                "shot": 0,
+                "type": "account",
+                "label": "使用账号",
+                "message": f"本次任务使用手机号：{account}",
+            },
+        )
     returncode = int(item.get("returncode") if item.get("returncode") is not None else 0)
 
     nickname = normalize_text(
