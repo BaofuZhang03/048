@@ -482,6 +482,47 @@ def sanitize_admin_log_line(line: str) -> str:
     return normalize_text(text, 1200)
 
 
+def extract_legacy_first_page_token_trace(log_text: str) -> list[dict]:
+    """Build the first successful page request trace from pre-marker logs."""
+    started_at = ""
+    started_url = ""
+    server_now = ""
+    for line in log_text.splitlines():
+        if "submit parameter resolved" in line:
+            break
+        if any(needle in line for needle in ("正式预取页面 token", "正式获取 token", "开始探测", "第 1 枪在")):
+            started_at = extract_log_timestamp(line) or started_at
+            url_match = re.search(r"https?://[^\s，,]+", line)
+            if url_match:
+                started_url = url_match.group(0)
+        server_now_match = re.search(r"页面 serverNow=([^\s，,]+)", line)
+        if server_now_match:
+            server_now = server_now_match.group(1)
+        if not any(needle in line for needle in ("已从 http", "拿到可复用 token", "即时获取 token")):
+            continue
+        url_match = re.search(r"https?://[^\s，,]+", line)
+        url = started_url or (url_match.group(0) if url_match else "")
+        received_at = extract_log_timestamp(line)
+        if started_at and received_at:
+            return [
+                {
+                    "time": started_at,
+                    "shot": 0,
+                    "type": "first_page_token",
+                    "label": "第一抢页面请求",
+                    "message": f"开始请求页面 · URL：{url or '未记录'}",
+                },
+                {
+                    "time": received_at,
+                    "shot": 0,
+                    "type": "first_page_token",
+                    "label": "第一抢页面Token",
+                    "message": f"获取页面信息成功 · 页面 serverNow：{server_now or '未提取到'}",
+                },
+            ]
+    return []
+
+
 def extract_admin_timeline(log_text: str) -> list[dict]:
     timeline: list[dict] = []
     submit_count = 0
@@ -576,6 +617,10 @@ def extract_admin_timeline(log_text: str) -> list[dict]:
                     }
                 )
                 break
+    if not any(event.get("type") == "first_page_token" for event in timeline):
+        trace = extract_legacy_first_page_token_trace(log_text)
+        account_end = next((index + 1 for index, event in enumerate(timeline) if event.get("type") == "account"), 0)
+        timeline[account_end:account_end] = trace
     if sum(event.get("type") == "first_page_token" for event in timeline) == 2:
         timeline = [event for event in timeline if event.get("type") != "token"]
     return timeline[-80:]
@@ -1120,6 +1165,19 @@ def process_run(run_dir: pathlib.Path, server_id: str) -> tuple[list[dict], dict
     results = []
     for item in summary_items:
         if isinstance(item, dict):
+            log_path = pathlib.Path(str(item.get("log_path") or ""))
+            if not log_path.is_absolute():
+                log_path = run_dir / log_path
+            elif not log_path.exists() and (run_dir / log_path.name).exists():
+                log_path = run_dir / log_path.name
+            if pathlib.Path(str(log_path) + ".manual_cancelled").is_file():
+                continue
+            try:
+                returncode = int(item.get("returncode"))
+            except (TypeError, ValueError):
+                returncode = 0
+            if returncode in {-15, -9, 130, 137, 143}:
+                continue
             results.append(build_result(run_dir, summary, payload, item, server_id))
     processed = {
         "ok": True,
