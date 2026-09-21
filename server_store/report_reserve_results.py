@@ -549,6 +549,7 @@ def extract_admin_timeline(log_text: str) -> list[dict]:
         ("submit", "提交参数", "submit parameter resolved"),
         ("submit", "提交签名", "submit enc:"),
         ("submit", "提交结果", "'success':"),
+        ("submit", "超时回查成功", "[提交超时回查成功]"),
         ("submit", "提交跳转", "代码:302"),
         ("submit", "提交跳转", "代码:303"),
         ("token", "页面跳转", "HTTP 302"),

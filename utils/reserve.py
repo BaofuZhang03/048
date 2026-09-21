@@ -407,7 +407,7 @@ class reserve:
         )
         self.submit_request_timeout = (
             float(os.getenv("CX_SUBMIT_CONNECT_TIMEOUT", "5")),
-            float(os.getenv("CX_SUBMIT_READ_TIMEOUT", "18")),
+            float(os.getenv("CX_SUBMIT_READ_TIMEOUT", "24")),
         )
         # 策略 C 的轻探测超时：只用于 probe_not_open_fast() 判断页面是否仍未开放。
         self.fast_probe_timeout = (
@@ -525,7 +525,94 @@ class reserve:
         raw = str(url or "")
         return [(self.api_family, raw)] if raw else []
 
-    def _submit_with_fallback(self, parm: dict, *, request_name: str):
+    @staticmethod
+    def _reservation_timestamp_matches(value, target: datetime.datetime) -> bool:
+        try:
+            if isinstance(value, (int, float)) or str(value).strip().isdigit():
+                parsed = datetime.datetime.fromtimestamp(
+                    int(value) / 1000,
+                    tz=datetime.timezone(datetime.timedelta(hours=8)),
+                )
+            else:
+                text = str(value or "").strip()
+                if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", text):
+                    return text[:5] == target.strftime("%H:%M")
+                parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=target.tzinfo)
+                else:
+                    parsed = parsed.astimezone(target.tzinfo)
+            return parsed.replace(second=0, microsecond=0) == target.replace(second=0, microsecond=0)
+        except (TypeError, ValueError, OverflowError, OSError):
+            return False
+
+    def _confirm_submit_from_current_reservations(self, parm: dict, seat_page_id="") -> dict | None:
+        """Read back the logged-in user's current reservations after a submit read timeout."""
+        start = self._parse_reserve_datetime(parm.get("day"), parm.get("startTime"))
+        end = self._parse_reserve_datetime(parm.get("day"), parm.get("endTime"))
+        if not start or not end:
+            return None
+
+        family = "seatengine" if self.api_family.startswith("seatengine") else "seat"
+        families = (family, "seatengine" if family == "seat" else "seat")
+        params = {
+            "fidEnc": parm.get("deptIdEnc", ""),
+            "seatId": seat_page_id or parm.get("roomId", ""),
+        }
+        for candidate in families:
+            url = f"https://office.chaoxing.com/data/apps/{candidate}/index"
+            try:
+                response = self._get(
+                    url=url,
+                    params=params,
+                    verify=False,
+                    attempts=1,
+                    request_name="submit timeout reservation confirmation",
+                )
+                payload = response.json()
+            except (requests.exceptions.RequestException, ValueError) as exc:
+                logging.warning("submit timeout confirmation failed via %s: %s", candidate, exc)
+                continue
+
+            records = (
+                payload.get("data", {}).get("curReserves", [])
+                if isinstance(payload, dict) and payload.get("success") is True
+                else []
+            )
+            for record in records if isinstance(records, list) else []:
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("status", "")) != "0":
+                    continue
+                if str(record.get("today", "")) != str(parm.get("day", "")):
+                    continue
+                if str(record.get("roomId", "")) != str(parm.get("roomId", "")):
+                    continue
+                if str(record.get("seatNum", "")) != str(parm.get("seatNum", "")):
+                    continue
+                if not self._reservation_timestamp_matches(record.get("startTime"), start):
+                    continue
+                if not self._reservation_timestamp_matches(record.get("endTime"), end):
+                    continue
+                logging.warning(
+                    "[提交超时回查成功] 已在当前待签到预约中确认本次提交："
+                    "day=%s, roomId=%s, seatNum=%s, time=%s~%s, reservationId=%s",
+                    parm.get("day", ""),
+                    parm.get("roomId", ""),
+                    parm.get("seatNum", ""),
+                    parm.get("startTime", ""),
+                    parm.get("endTime", ""),
+                    record.get("id", ""),
+                )
+                return {
+                    "success": True,
+                    "msg": "提交响应超时，但已在当前待签到预约中确认成功",
+                    "confirmed_after_timeout": True,
+                    "reservation": record,
+                }
+        return None
+
+    def _submit_with_fallback(self, parm: dict, *, request_name: str, seat_page_id=""):
         family = self.api_family
         submit_url = self.api_urls[family]["submit"]
         started_at = time.monotonic()
@@ -542,6 +629,12 @@ class reserve:
             elapsed_seconds = time.monotonic() - started_at
             is_read_timeout = isinstance(e, requests.exceptions.ReadTimeout)
             is_connect_timeout = isinstance(e, requests.exceptions.ConnectTimeout)
+            if is_read_timeout:
+                confirmed = self._confirm_submit_from_current_reservations(
+                    parm, seat_page_id=seat_page_id
+                )
+                if confirmed:
+                    return confirmed
             diagnostic = {
                 "request_name": request_name,
                 "exception_type": type(e).__name__,
@@ -3084,7 +3177,12 @@ class reserve:
         logging.info(f"submit enc: {parm['enc']}")
 
         # 按前端行为采用表单提交（POST body），并关闭证书验证以避免告警
-        data = self._submit_with_fallback(parm, request_name="seat submit")
+        seat_page_id = parse_qs(urlparse(str(url or "")).query).get(
+            "seatId", [roomid]
+        )[0]
+        data = self._submit_with_fallback(
+            parm, request_name="seat submit", seat_page_id=seat_page_id
+        )
         if data is None:
             return False
         self.last_submit_result = data
