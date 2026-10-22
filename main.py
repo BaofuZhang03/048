@@ -407,6 +407,7 @@ ENABLE_SLIDER = False  # 是否有滑块验证（调试阶段先关闭）
 ENABLE_TEXTCLICK = False  # 是否有选字验证码（默认使用超级鹰打码平台）
 ENABLE_ICONCLICK = False  # 是否有图标点选验证码（超级鹰 9103）
 ENABLE_ROTATE = False  # 是否有旋转滑块验证码（三平台识别）
+ENABLE_PRE_OPEN_TIME_SAMPLING = False  # 是否在抢座前进行独立时间采样
 ICONCLICK_OCR_PROVIDER = "chaojiying"  # 图标点选识别平台：chaojiying / tulingcloud / jfbym
 ROTATE_OCR_PROVIDER = "geepass"  # 旋转滑块首选：geepass / tulingcloud / jfbym
 SEAT_API_MODE = "seat"  # 页面 token 接口模式：auto / seatengine / seat / seatengine_code / seat_code
@@ -510,6 +511,9 @@ def _load_runtime_config(config_path, dispatch_mode, action):
             "enable_textclick": payload.get("enable_textclick", ENABLE_TEXTCLICK),
             "enable_iconclick": payload.get("enable_iconclick", ENABLE_ICONCLICK),
             "enable_rotate": payload.get("enable_rotate", ENABLE_ROTATE),
+            "enable_pre_open_time_sampling": payload.get(
+                "enable_pre_open_time_sampling", ENABLE_PRE_OPEN_TIME_SAMPLING
+            ),
             "iconclick_ocr_provider": payload.get("iconclick_ocr_provider", ICONCLICK_OCR_PROVIDER),
             "rotate_ocr_provider": payload.get("rotate_ocr_provider", ROTATE_OCR_PROVIDER),
             "relogin_every_loop": False,
@@ -549,6 +553,7 @@ def _apply_strategy_config(config):
     global ENABLE_TEXTCLICK
     global ENABLE_ICONCLICK
     global ENABLE_ROTATE
+    global ENABLE_PRE_OPEN_TIME_SAMPLING
     global ICONCLICK_OCR_PROVIDER
     global ROTATE_OCR_PROVIDER
     global STRATEGY_LOGIN_LEAD_SECONDS
@@ -575,6 +580,9 @@ def _apply_strategy_config(config):
     ENABLE_TEXTCLICK = bool(config.get("enable_textclick", ENABLE_TEXTCLICK))
     ENABLE_ICONCLICK = bool(config.get("enable_iconclick", ENABLE_ICONCLICK))
     ENABLE_ROTATE = bool(config.get("enable_rotate", ENABLE_ROTATE))
+    ENABLE_PRE_OPEN_TIME_SAMPLING = bool(
+        config.get("enable_pre_open_time_sampling", ENABLE_PRE_OPEN_TIME_SAMPLING)
+    )
     iconclick_provider = str(config.get("iconclick_ocr_provider", ICONCLICK_OCR_PROVIDER)).strip().lower()
     ICONCLICK_OCR_PROVIDER = (
         iconclick_provider
@@ -1065,10 +1073,12 @@ def strategic_first_attempt(
             raise Exception("USERNAMES and PASSWORDS count mismatch")
 
     # 观察模块使用独立登录态；在正式登录前三秒停止，不改变 target_dt。
-    sampler_user = next(
-        (user for user in users if get_current_dayofweek(action) in user.get("daysofweek", [])),
-        None,
-    )
+    sampler_user = None
+    if ENABLE_PRE_OPEN_TIME_SAMPLING:
+        sampler_user = next(
+            (user for user in users if get_current_dayofweek(action) in user.get("daysofweek", [])),
+            None,
+        )
     if sampler_user is not None:
         sampler_index = users.index(sampler_user)
         sampler_username = sampler_user["username"]
